@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <meta charset="utf-8">
+
+    <title>Game of Life - WebGPU</title>
+
+    <style>
+        body {
+            margin: 0;
+            display: flex;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas></canvas>
+
+    <script type="module">
+        const WIDTH = window.innerWidth / 8;
+        const HEIGHT = window.innerHeight / 8;
+
+        const SIZE = Math.max(WIDTH, HEIGHT);
+
+        const WORKGROUP_SIZE = 8;
+        const WORKGROUP_COUNT = Math.ceil(SIZE / WORKGROUP_SIZE);
+
+        const UPDATE_INTERVAL = 100;
+
+        if (!navigator.gpu)
+            throw new Error("WebGPU not supported on this browser.");
+
+        const adapter = await navigator.gpu.requestAdapter();
+
+        if (!adapter)
+            throw new Error("No appropriate GPUAdapter found.");
+
+        const device = await adapter.requestDevice();
+
+        const format = navigator.gpu.getPreferredCanvasFormat();
+
+        const canvas = document.querySelector("canvas");
+
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        const context = canvas.getContext("webgpu");
+
+        context.configure({
+            device: device,
+            format: format
+        });
+
+        // Shaders
+
+        const computeShaderModule = device.createShaderModule({
+            label: "Compute shader module",
+            code: `
+                @group(0) @binding(0) var<uniform> size: vec2f;
+
+                @group(0) @binding(1) var<storage, read> input: array<u32>;
+                @group(0) @binding(2) var<storage, read_write> output: array<u32>;
+
+                fn get_index(location: vec2u) -> u32 {
+                    return (location.y % u32(size.y)) * u32(size.x) + (location.x % u32(size.x));
+                }
+
+                fn is_active(x: u32, y: u32) -> u32 {
+                    return input[get_index(vec2(x, y))];
+                }
+
+                @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+                fn compute_main(@builtin(global_invocation_id) location: vec3u) {
+                    let active_neighbors = is_active(location.x - 1, location.y + 1) + 
+                                           is_active(location.x,     location.y + 1) + 
+                                           is_active(location.x + 1, location.y + 1) +
+                                           is_active(location.x - 1, location.y)     + 
+                                           is_active(location.x + 1, location.y)     +
+                                           is_active(location.x - 1, location.y - 1) + 
+                                           is_active(location.x, location.y - 1)     + 
+                                           is_active(location.x + 1, location.y - 1);
+
+                    
+                    let index = get_index(location.xy);
+
+                    switch active_neighbors {
+                        case 2: {
+                            output[index] = input[index];
+                        }
+                        case 3: {
+                            output[index] = 1;
+                        }
+                        default: {
+                            output[index] = 0;
+                        }
+                    }
+                }
+            `
+        });
+
+        const renderShaderModule = device.createShaderModule({
+            label: "Render shader module",
+            code: `
+                struct VertexInput {
+                    @location(0) position: vec2f,
+                    @builtin(instance_index) index: u32
+                }
+
+                struct VertexOutput {
+                    @builtin(position) position: vec4f,
+                    @location(0) location: vec2f
+                }
+
+                @group(0) @binding(0) var<uniform> size: vec2f;
+                @group(0) @binding(1) var<storage> state: array<u32>;
+
+                @vertex
+                fn vertex_main(input: VertexInput) -> VertexOutput {
+                    let index = f32(input.index);
+
+                    let location = vec2f(index % size.x, floor(index / size.x));
+
+                    let state = f32(state[input.index]);
+
+                    let offset = location / size * 2.0;
+
+                    let position = (input.position * state + 1.0) / size - 1.0 + offset;
+
+                    var output: VertexOutput;
+
+                    output.position = vec4f(position, 0.0, 1.0);
+                    output.location = location;
+
+                    return output;
+                }
+                
+                @fragment
+                fn fragment_main(input: VertexOutput) -> @location(0) vec4f {   
+                    let color = input.location / size;
+
+                    return vec4f(color, 0.5, 1.0);
+                }
+            `
+        });
+
+
+        // Size uniform buffer
+
+        const uniformData = new Float32Array([WIDTH, HEIGHT]);
+
+        const uniformBuffer = device.createBuffer({
+            label: "Size uniform buffer",
+            size: uniformData.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+
+        device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+        // State storage buffers
+
+        const storageData = new Uint32Array(WIDTH * HEIGHT);
+
+        const storageBuffers = [
+            device.createBuffer({
+                label: "Input state storage buffer",
+                size: storageData.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            }),
+            device.createBuffer({
+                label: "Output state storage buffer",
+                size: storageData.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            })];
+
+        for (let i = 0; i < storageData.length; ++i)
+            storageData[i] = Math.random() < 0.3 ? 1 : 0;
+
+        device.queue.writeBuffer(storageBuffers[0], 0, storageData);
+
+        // Quad vertex
+
+        const vertexData = new Float32Array([
+            -0.9, -0.9,
+            +0.9, -0.9,
+            +0.9, +0.9,
+
+            -0.9, -0.9,
+            +0.9, +0.9,
+            -0.9, +0.9
+        ]);
+
+        const vertexBufferLayout = {
+            arrayStride: 8,
+            attributes: [{
+                format: "float32x2",
+                offset: 0,
+                shaderLocation: 0
+            }]
+        };
+
+        const vertexBuffer = device.createBuffer({
+            label: "Quad vertex buffer",
+            size: vertexData.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+        });
+
+        device.queue.writeBuffer(vertexBuffer, 0, vertexData);
+
+        // Bind groups
+
+        const bindGroupLayout = device.createBindGroupLayout({
+            label: "Bind group layout",
+            entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform" }
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX,
+                buffer: { type: "read-only-storage" }
+            },
+            {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage" }
+            }]
+        });
+
+        const bindGroups = [
+            device.createBindGroup({
+                label: "Input bind group",
+                layout: bindGroupLayout,
+                entries: [{
+                    binding: 0,
+                    resource: { buffer: uniformBuffer }
+                },
+                {
+                    binding: 1,
+                    resource: { buffer: storageBuffers[0] }
+                },
+                {
+                    binding: 2,
+                    resource: { buffer: storageBuffers[1] }
+                }]
+            }),
+            device.createBindGroup({
+                label: "Output bind group",
+                layout: bindGroupLayout,
+                entries: [{
+                    binding: 0,
+                    resource: { buffer: uniformBuffer }
+                },
+                {
+                    binding: 1,
+                    resource: { buffer: storageBuffers[1] }
+                },
+                {
+                    binding: 2,
+                    resource: { buffer: storageBuffers[0] }
+                }]
+            })];
+
+        // Pipelines
+
+        const pipelineLayout = device.createPipelineLayout({
+            label: "Pipeline layout",
+            bindGroupLayouts: [bindGroupLayout]
+        });
+
+        const computePipeline = device.createComputePipeline({
+            label: "Compute pipeline",
+            layout: pipelineLayout,
+            compute: {
+                module: computeShaderModule,
+                entryPoint: "compute_main"
+            }
+        });
+
+        const renderPipeline = device.createRenderPipeline({
+            label: "Render pipeline",
+            layout: pipelineLayout,
+            vertex: {
+                module: renderShaderModule,
+                entryPoint: "vertex_main",
+                buffers: [vertexBufferLayout]
+            },
+            fragment: {
+                module: renderShaderModule,
+                entryPoint: "fragment_main",
+                targets: [{
+                    format: format
+                }]
+            }
+        });
+
+        // ...
+
+        let step = 0;
+
+        function update() {
+            const encoder = device.createCommandEncoder();
+
+            const computePass = encoder.beginComputePass();
+
+            computePass.setPipeline(computePipeline);
+
+            computePass.setBindGroup(0, bindGroups[step % 2]);
+
+            computePass.dispatchWorkgroups(WORKGROUP_COUNT, WORKGROUP_COUNT);
+
+            computePass.end();
+
+            step++;
+
+            const renderPass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(),
+                    loadOp: "clear",
+                    clearValue: { r: 0.05, g: 0.05, b: 0.05, a: 1.0 },
+                    storeOp: "store"
+                }]
+            });
+
+            renderPass.setPipeline(renderPipeline);
+
+            renderPass.setBindGroup(0, bindGroups[step % 2]);
+
+            renderPass.setVertexBuffer(0, vertexBuffer);
+
+            renderPass.draw(vertexData.length / 2, WIDTH * HEIGHT);
+
+            renderPass.end();
+
+            device.queue.submit([encoder.finish()]);
+        }
+
+        setInterval(update, UPDATE_INTERVAL);
+    </script>
+</body>
+
+</html>
