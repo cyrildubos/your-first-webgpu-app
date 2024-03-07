@@ -1,4 +1,4 @@
-# Game of Life - WebGPU
+# Your first WebGPU app
 
 ## Reference 
 
